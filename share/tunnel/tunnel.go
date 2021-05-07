@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
 	"sync"
 	"time"
@@ -25,6 +26,9 @@ type Config struct {
 	Outbound  bool
 	Socks     bool
 	KeepAlive time.Duration
+	Remotes   settings.Remotes
+	ReqHeader *http.Header
+	Changes   chan<- struct{}
 }
 
 //Tunnel represents an SSH tunnel with proxy capabilities.
@@ -45,13 +49,43 @@ type Tunnel struct {
 	//internals
 	connStats   cnet.ConnCount
 	socksServer *socks5.Server
+	//channels
+	channelsMut sync.RWMutex
+	channels    map[string]*TunnelChannel
+}
+
+type TunnelChannel struct {
+	Remote    *settings.Remote
+	ReqHeader *http.Header
+
+	closed   bool
+	closedMu sync.RWMutex
+	closeCh  chan struct{}
+}
+
+func (ch *TunnelChannel) Close() {
+	ch.closedMu.Lock()
+	if ch.closed {
+		return
+	}
+	close(ch.closeCh)
+	ch.closed = true
+	ch.closedMu.Unlock()
+}
+
+func (ch *TunnelChannel) Closed() bool {
+	ch.closedMu.RLock()
+	closed := ch.closed
+	ch.closedMu.RUnlock()
+	return closed
 }
 
 //New Tunnel from the given Config
 func New(c Config) *Tunnel {
 	c.Logger = c.Logger.Fork("tun")
 	t := &Tunnel{
-		Config: c,
+		Config:   c,
+		channels: make(map[string]*TunnelChannel),
 	}
 	t.activatingConn.Add(1)
 	//setup socks server (not listening on any port!)
@@ -64,8 +98,38 @@ func New(c Config) *Tunnel {
 		t.socksServer, _ = socks5.New(&socks5.Config{Logger: sl})
 		extra += " (SOCKS enabled)"
 	}
+	for _, remote := range c.Remotes {
+		closeCh := make(chan struct{}, 1)
+		t.channels[remote.Remote()] = &TunnelChannel{
+			Remote:    remote,
+			ReqHeader: c.ReqHeader,
+			closeCh:   closeCh,
+		}
+		go func(closed <-chan struct{}, remote string) {
+			<-closed
+			t.channelsMut.Lock()
+			delete(t.channels, remote)
+			t.channelsMut.Unlock()
+			if c.Changes != nil {
+				t.Changes <- struct{}{}
+			}
+		}(closeCh, remote.Remote())
+	}
+	if c.Changes != nil {
+		t.Changes <- struct{}{}
+	}
 	t.Debugf("Created%s", extra)
 	return t
+}
+
+// Channels returns tunnel channels
+func (t *Tunnel) Channels() (result []*TunnelChannel) {
+	t.channelsMut.RLock()
+	for _, channel := range t.channels {
+		result = append(result, channel)
+	}
+	t.channelsMut.RUnlock()
+	return result
 }
 
 //BindSSH provides an active SSH for use for tunnelling
@@ -163,7 +227,8 @@ func (t *Tunnel) BindRemotes(ctx context.Context, remotes []*settings.Remote) er
 	for _, proxy := range proxies {
 		p := proxy
 		eg.Go(func() error {
-			return p.Run(ctx)
+			err := p.Run(ctx)
+			return err
 		})
 	}
 	t.Debugf("Bound proxies")

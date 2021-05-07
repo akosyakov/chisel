@@ -9,6 +9,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"regexp"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -17,6 +18,7 @@ import (
 	"github.com/jpillora/chisel/share/cio"
 	"github.com/jpillora/chisel/share/cnet"
 	"github.com/jpillora/chisel/share/settings"
+	"github.com/jpillora/chisel/share/tunnel"
 	"github.com/jpillora/requestlog"
 	"golang.org/x/crypto/ssh"
 )
@@ -46,6 +48,12 @@ type Server struct {
 	sessions     *settings.Users
 	sshConfig    *ssh.ServerConfig
 	users        *settings.UserIndex
+
+	tunnelsMut sync.RWMutex
+	tunnels    map[*tunnel.Tunnel]struct{}
+
+	subsMut sync.RWMutex
+	subs    map[chan<- struct{}]struct{}
 }
 
 var upgrader = websocket.Upgrader{
@@ -61,6 +69,8 @@ func NewServer(c *Config) (*Server, error) {
 		httpServer: cnet.NewHTTPServer(),
 		Logger:     cio.NewLogger("server"),
 		sessions:   settings.NewUsers(),
+		tunnels:    make(map[*tunnel.Tunnel]struct{}),
+		subs:       make(map[chan<- struct{}]struct{}),
 	}
 	server.Info = true
 	server.users = settings.NewUserIndex(server.Logger)
@@ -117,6 +127,37 @@ func NewServer(c *Config) (*Server, error) {
 		server.Infof("Reverse tunnelling enabled")
 	}
 	return server, nil
+}
+
+// Channels returns tunnel channels
+func (s *Server) Channels() (result []*tunnel.TunnelChannel) {
+	s.tunnelsMut.RLock()
+	for tunnel := range s.tunnels {
+		result = append(result, tunnel.Channels()...)
+	}
+	s.tunnelsMut.RUnlock()
+	return result
+}
+
+func (s *Server) AddObserver(sub chan<- struct{}) {
+	s.subsMut.Lock()
+	s.subs[sub] = struct{}{}
+	s.subsMut.Unlock()
+}
+
+func (s *Server) RemoveObserver(sub chan<- struct{}) {
+	s.subsMut.Lock()
+	delete(s.subs, sub)
+	s.subsMut.Unlock()
+}
+
+func (s *Server) notify() {
+	s.subsMut.RLock()
+	for sub := range s.subs {
+		sub <- struct{}{}
+	}
+	s.subsMut.RUnlock()
+
 }
 
 // Run is responsible for starting the chisel service.

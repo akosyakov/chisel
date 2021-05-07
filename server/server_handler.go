@@ -135,13 +135,34 @@ func (s *Server) handleWebsocket(w http.ResponseWriter, req *http.Request) {
 	//successfuly validated config!
 	r.Reply(true, nil)
 	//tunnel per ssh connection
+	closed := false
+	changes := make(chan struct{}, 1)
 	tunnel := tunnel.New(tunnel.Config{
 		Logger:    l,
 		Inbound:   s.config.Reverse,
 		Outbound:  true, //server always accepts outbound
 		Socks:     s.config.Socks5,
 		KeepAlive: s.config.KeepAlive,
+		Remotes:   c.Remotes,
+		ReqHeader: &req.Header,
+		Changes:   changes,
 	})
+	s.tunnelsMut.Lock()
+	s.tunnels[tunnel] = struct{}{}
+	s.tunnelsMut.Unlock()
+	defer func() {
+		s.tunnelsMut.Lock()
+		delete(s.tunnels, tunnel)
+		closed = true
+		s.tunnelsMut.Unlock()
+		changes <- struct{}{}
+	}()
+	go func() {
+		for !closed {
+			<-changes
+			s.notify()
+		}
+	}()
 	//bind
 	eg, ctx := errgroup.WithContext(req.Context())
 	eg.Go(func() error {

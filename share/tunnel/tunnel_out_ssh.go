@@ -41,6 +41,16 @@ func (t *Tunnel) handleSSHChannel(ch ssh.NewChannel) {
 	hostPort, proto := settings.L4Proto(remote)
 	udp := proto == "udp"
 	socks := hostPort == "socks"
+
+	t.channelsMut.RLock()
+	tch, exists := t.channels[hostPort]
+	t.channelsMut.RUnlock()
+	if !exists || tch.Closed() {
+		t.Debugf("unknown channel")
+		ch.Reject(ssh.UnknownChannelType, "unknown channel")
+		return
+	}
+
 	if socks && t.socksServer == nil {
 		t.Debugf("Denied socks request, please enable socks")
 		ch.Reject(ssh.Prohibited, "SOCKS5 is not enabled")
@@ -52,6 +62,14 @@ func (t *Tunnel) handleSSHChannel(ch ssh.NewChannel) {
 		return
 	}
 	stream := io.ReadWriteCloser(sshChan)
+	if tch.Closed() {
+		stream.Close()
+		return
+	}
+	go func() {
+		<-tch.closeCh
+		stream.Close()
+	}()
 	//cnet.MeterRWC(t.Logger.Fork("sshchan"), sshChan)
 	defer stream.Close()
 	go ssh.DiscardRequests(reqs)

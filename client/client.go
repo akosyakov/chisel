@@ -176,10 +176,12 @@ func NewClient(c *Config) (*Client, error) {
 	}
 	//prepare client tunnel
 	client.tunnel = tunnel.New(tunnel.Config{
-		Logger:   client.Logger,
-		Inbound:  true, //client always accepts inbound
-		Outbound: hasReverse,
-		Socks:    hasReverse && hasSocks,
+		Logger:    client.Logger,
+		Inbound:   true, //client always accepts inbound
+		Outbound:  hasReverse,
+		Socks:     hasReverse && hasSocks,
+		Remotes:   client.computed.Remotes,
+		ReqHeader: &c.Headers,
 	})
 	return client, nil
 }
